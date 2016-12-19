@@ -1,0 +1,172 @@
+#!/usr/bin/env python
+
+import optparse
+import re
+import subprocess
+import sys
+
+
+_GIT_LOG_RE = re.compile(
+    r'(?P<commit>[0-9A-Fa-f]+) (?P<tree>[0-9A-Fa-f]+) \[(?P<parents>[0-9A-Fa-f ]*)\] ##\{(?P<subject>.*)\}##')
+
+
+class Commit:
+    def __init__(self, commit, tree, parents, subject):
+        self.commit = commit
+        self.tree = tree
+        self.parents = parents
+        self.subject = subject
+
+    @property
+    def parents(self):
+        return self.parents
+
+    @property
+    def subject(self):
+        return self.subject
+
+    def __eq__(self, other):
+        return (self.tree == other.tree and
+                self.parents == other.parents and
+                self.subject == other.subject)
+
+    def __ne__(self, other):
+        return not (self == other)
+
+
+def get_hashes(head, out_commit_dict):
+    hashes = []
+
+    log_lines = subprocess.check_output(['git', 'log', '--pretty=%H %T [%P] ##{%s}##', head])
+    for line in log_lines.splitlines():
+        line_match = _GIT_LOG_RE.match(line)
+        commit_hash = line_match.group('commit')
+        tree_hash = line_match.group('tree')
+        parents_str = line_match.group('parents')
+        subject = line_match.group('subject')
+        parents_list = parents_str.split()
+        if len(parents_list) == 0:
+            parents = None
+        elif len(parents_list) == 1:
+            parents = parents_list[0]
+        else:
+            parents = parents_list
+
+        hashes.append(commit_hash)
+        commit = Commit(commit_hash, tree_hash, parents, subject)
+        if commit_hash not in out_commit_dict:
+            out_commit_dict[commit_hash] = commit
+        elif out_commit_dict[commit_hash] != commit:
+            raise RuntimeError('FATAL: Commit "{0}" does not match.'.format(commit_hash))
+
+    return hashes
+
+
+def get_mainline(hashes, commits):
+    mainline = []
+    head = hashes[0]
+
+    while head:
+        mainline.append(head)
+        if isinstance(commits[head].parents, list):
+            head = commits[head].parents[0]  # mainline
+        else:
+            head = commits[head].parents
+
+    return mainline
+
+
+def estimate_merges(hashes, commits, mainline):
+    merges = {}
+    mainline_set = set(mainline)
+
+    merges[hashes[0]] = None
+    # The mainline should be marked before iterating as commented below.
+    for commit_hash in mainline:
+        merges[commit_hash] = None
+
+    for commit_hash in hashes:
+        # NOTE: A branch commit (a parent of multiple commits) on the mainline can be marked as a
+        # branch commit (a parent of another commit on a branch) before marked as a mainline commit
+        # (a parent of another commit on the mainline). It is because the mainline is marked before
+        # iterating as above.
+        if commits[commit_hash].parents is None:
+            continue
+        elif isinstance(commits[commit_hash].parents, list):
+            if commits[commit_hash].parents[0] not in merges:
+                merges[commits[commit_hash].parents[0]] = merges[commit_hash]
+            if commits[commit_hash].parents[1] not in merges:
+                merges[commits[commit_hash].parents[1]] = merges[commit_hash] if merges[commit_hash] else commit_hash
+        elif isinstance(commits[commit_hash].parents, basestring):
+            if commits[commit_hash].parents not in merges:
+                merges[commits[commit_hash].parents] = merges[commit_hash]
+        else:
+            raise 'hoge'
+
+    for commit_hash in hashes:
+        print '{0}: {1}'.format(commit_hash, merges[commit_hash])
+
+    return merges
+
+
+def history(head, commits, merges, mainline, merge=None):
+    print '{0}: {1}'.format(head, commits[head].subject)
+
+    if merge not in merges:
+        merges[merge] = set()
+    merges[merge].add(head)
+
+    if merge:
+        if head in mainline:
+            return
+    else:
+        mainline.add(head)
+
+    if commits[head].parents is None:
+        pass
+    elif isinstance(commits[head].parents, basestring):
+        history(commits[head].parents, commits, merges, mainline, merge)
+    elif isinstance(commits[head].parents, list):
+        history(commits[head].parents[0], commits, merges, mainline, merge)  # mainline
+        history(commits[head].parents[1], commits, merges, mainline, head)   # merged
+    else:
+        raise RuntimeError('FATAL: Commit "{0}" has broken parents.'.format(head))
+
+
+def main(argv):
+    if 'check_output' not in dir(subprocess):
+        raise NotImplementedError('Needs Python 2.7+.')
+
+    option_parser = optparse.OptionParser(usage='%prog [options] <development-branch> <release-branch>')
+    (options, args) = option_parser.parse_args(argv)
+
+    if len(args) < 3:
+        raise SyntaxError('Too few arguments.')
+
+    dev_branch = args[1]
+    rel_branch = args[2]
+
+    commits = {}
+    dev_hashes = get_hashes(dev_branch, commits)
+    rel_hashes = get_hashes(rel_branch, commits)
+
+    dev_mainline = get_mainline(dev_hashes, commits)
+    #for commit in dev_mainline:
+    #    print '{0}: {1}'.format(commit, commits[commit].subject)
+    dev_merges = estimate_merges(dev_hashes, commits, dev_mainline)
+
+    """
+    merges = {}
+    mainline = set()
+    history(dev_hashes[0], commits, merges, mainline)
+    # history(rel_hashes[0], commits, merges)
+
+    forgotten_hashes = set(dev_hashes) - set(rel_hashes)
+    #for forgotten_hash in forgotten_hashes:
+    #    print '{0}: {1}'.format(forgotten_hash, commits[forgotten_hash].subject)
+    forbidden_hashes = set(rel_hashes) - set(dev_hashes)
+    """
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))
